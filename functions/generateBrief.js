@@ -1,145 +1,105 @@
-const Parser = require("rss-parser")
 const axios = require("axios")
 
-const parser = new Parser()
+// ⚠️ Make sure you set this in Firebase env later
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY
 
-// ====== CONFIG ======
-const RSS_SOURCES = [
-  "http://feeds.bbci.co.uk/news/rss.xml",
-  "http://rss.cnn.com/rss/edition.rss",
-  "https://feeds.reuters.com/reuters/topNews",
-]
+async function callLLM(clusterArticles) {
+  const titles = clusterArticles.map(a => a.title).join("\n")
 
-// ====== HELPERS ======
+  const prompt = `
+You are an expert news analyst.
 
-function normalizeText(text = "") {
-  return text.toLowerCase().replace(/[^\w\s]/gi, "")
+Given these articles, produce:
+
+1. A concise summary (2 lines max)
+2. A "why it matters" insight (ONE sharp line explaining impact)
+
+Rules:
+- Do NOT repeat headlines
+- Focus on meaning, impact, consequence
+- No generic phrases
+
+Return JSON:
+{
+  "summary": "...",
+  "whyItMatters": "..."
 }
 
-function getBestImage(articles) {
-  for (const a of articles) {
-    if (a.image && a.image.startsWith("http")) return a.image
-  }
-  return "https://images.unsplash.com/photo-1504711434969-e33886168f5c"
-}
+Articles:
+${titles}
+`
 
-function extractImage(item) {
-  if (item.enclosure?.url) return item.enclosure.url
-  if (item["media:content"]?.url) return item["media:content"].url
-
-  const match = item.content?.match(/<img.*?src="(.*?)"/)
-  if (match) return match[1]
-
-  return null
-}
-
-// ====== FETCH ======
-
-async function fetchAllFeeds() {
-  const results = await Promise.allSettled(
-    RSS_SOURCES.map(url => parser.parseURL(url))
+  const res = await axios.post(
+    "https://api.openai.com/v1/chat/completions",
+    {
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "user",
+          content: prompt,
+        },
+      ],
+      temperature: 0.4,
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+      },
+    }
   )
 
-  let articles = []
-
-  results.forEach(result => {
-    if (result.status === "fulfilled") {
-      const feed = result.value
-
-      feed.items.forEach(item => {
-        articles.push({
-          title: item.title,
-          url: item.link,
-          source: feed.title,
-          published: item.pubDate,
-          snippet: item.contentSnippet,
-          image: extractImage(item),
-        })
-      })
+  try {
+    const text = res.data.choices[0].message.content
+    return JSON.parse(text)
+  } catch (e) {
+    return {
+      summary: clusterArticles[0].title,
+      whyItMatters: "Developing situation with potential broader impact",
     }
-  })
-
-  return articles
+  }
 }
-
-// ====== CLUSTERING ======
-
-function clusterArticles(articles) {
-  const clusters = []
-
-  articles.forEach(article => {
-    const words = normalizeText(article.title).split(" ")
-
-    let matched = false
-
-    for (const cluster of clusters) {
-      const clusterWords = normalizeText(cluster[0].title).split(" ")
-
-      const overlap = words.filter(w => clusterWords.includes(w))
-
-      if (overlap.length >= 3) {
-        cluster.push(article)
-        matched = true
-        break
-      }
-    }
-
-    if (!matched) clusters.push([article])
-  })
-
-  return clusters
-}
-
-// ====== SUMMARY ======
-
-function generateSummary(cluster) {
-  const top = cluster.slice(0, 3)
-
-  return [
-    top.map(a => a.title).join(". "),
-    "Coverage from multiple sources indicates ongoing developments."
-  ]
-}
-
-// ====== MAIN ======
 
 module.exports = async function generateBrief() {
-  console.log("Fetching feeds...")
+  // 👉 STEP 1: Fetch RSS (you already have this, keep yours if better)
+  const rss = await axios.get(
+    "https://feeds.bbci.co.uk/news/world/rss.xml"
+  )
 
-  const articles = await fetchAllFeeds()
+  const items = rss.data.match(/<item>(.*?)<\/item>/gs) || []
 
-  console.log("Total fetched:", articles.length)
+  const articles = items.slice(0, 20).map(item => {
+    const title = item.match(/<title>(.*?)<\/title>/)?.[1] || ""
+    const link = item.match(/<link>(.*?)<\/link>/)?.[1] || ""
 
-  const clusters = clusterArticles(articles)
+    return {
+      title,
+      url: link,
+      source: "BBC",
+      topic: "World",
+      image: null,
+    }
+  })
 
-  console.log("Clusters:", clusters.length)
+  // 👉 STEP 2: Naive clustering (we’ll fix later)
+  const clusters = articles.map(a => [a])
 
-  const stories = clusters
-    .filter(c => c.length >= 2) // remove weak clusters
-    .slice(0, 12)
-    .map(cluster => {
-      const summary = generateSummary(cluster)
+  // 👉 STEP 3: Generate briefs
+  const stories = []
 
-      return {
-        title: cluster[0].title,
-        summary,
-        image: getBestImage(cluster),
-        source: cluster[0].source,
-        published: cluster[0].published,
-        topic: "General",
+  for (const cluster of clusters.slice(0, 10)) {
+    const ai = await callLLM(cluster)
 
-        sourceCount: new Set(cluster.map(a => a.source)).size,
-
-        timeline: cluster.slice(0, 5).map(a => ({
-          title: a.title,
-          source: a.source,
-          time: a.published,
-        })),
-      }
+    stories.push({
+      title: cluster[0].title,
+      summary: ai.summary,
+      whyItMatters: ai.whyItMatters,
+      source: cluster[0].source,
+      image: cluster[0].image,
+      timeline: cluster,
     })
+  }
 
   return {
     stories,
-    feed: articles.slice(0, 50),
   }
 }
